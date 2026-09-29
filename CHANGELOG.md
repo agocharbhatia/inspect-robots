@@ -9,6 +9,12 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **Core/CLI:** `eval_set(max_workers=N)` and `eval-set --max-workers N` run
+  independent simulation tasks concurrently, with per-task resources and
+  logs returned in input order. The default remains sequential. Parallel CLI
+  runs require `--no-prompt`; the Python API requires registered component
+  names ([#361](https://github.com/robocurve/inspect-robots/issues/361)).
+
 - **Agent plugin:** Support `service_tier` on the Responses wire, including
   `-P service_tier=fast` for OpenAI Fast mode, with validation and saved configuration.
 
