@@ -2,15 +2,57 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Sequence
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import ExitStack, suppress
 from itertools import islice
-from typing import TypeVar
+from types import TracebackType
+from typing import ParamSpec, TypeVar
 
-from inspect_robots.errors import ConfigError
+from inspect_robots.errors import ConfigError, EmbodimentFault, SafetyAbort
 
 _T = TypeVar("_T")
 _R = TypeVar("_R")
+_P = ParamSpec("_P")
+
+
+class HaltPreservingExitStack(ExitStack):
+    """Attempt every registered callback without replacing an active halt.
+
+    Callback failures during SafetyAbort, EmbodimentFault or KeyboardInterrupt
+    are secondary and reported as RuntimeWarnings. Otherwise callbacks retain
+    ExitStack's ordinary exception behavior, including cleanup-originated halts.
+    """
+
+    def callback(
+        self, callback: Callable[_P, _R], /, *args: _P.args, **kwds: _P.kwargs
+    ) -> Callable[_P, _R]:
+        """Register cleanup whose failure cannot mask an active stop signal."""
+
+        def exit_callback(
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            traceback: TracebackType | None,
+        ) -> bool:
+            try:
+                callback(*args, **kwds)
+            except BaseException as cleanup_error:
+                if not isinstance(exc, (SafetyAbort, EmbodimentFault, KeyboardInterrupt)):
+                    raise
+                # Warning filters and custom reporters can also raise. Neither
+                # may replace the halt or prevent the remaining cleanup.
+                with suppress(BaseException):
+                    warnings.warn(
+                        f"cleanup failed while preserving {type(exc).__name__}: "
+                        f"{type(cleanup_error).__name__}: {cleanup_error}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+            return False
+
+        self.push(exit_callback)
+        return callback
 
 
 # --- Argument validation helpers ---

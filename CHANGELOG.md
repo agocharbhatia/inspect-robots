@@ -5,17 +5,19 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). While the version is
 `0.x`, breaking changes may occur on any minor release.
 
-## [Unreleased]
+Unreleased changes live as fragments in [`changelog.d/`](changelog.d/README.md)
+and are compiled into a new version section at release.
+
+<!-- towncrier release notes start -->
+
+## [0.7.0 to 0.60.0]: consolidated log
 
 ### Added
 
-- **Core/CLI:** `eval_set(max_workers=N)` and `eval-set --max-workers N` run
-  independent simulation tasks concurrently, with per-task resources and
-  logs returned in input order. The default remains sequential. Parallel CLI
-  runs require `--no-prompt`; the Python API requires registered component
-  names ([#361](https://github.com/robocurve/inspect-robots/issues/361)).
+- **Agent plugin (0.28.0):** Accept `-P service_tier=ultrafast` on the Responses wire
+  for OpenAI Ultrafast mode, with a mock-embodiment example for API testing.
 
-- **Agent plugin:** Support `service_tier` on the Responses wire, including
+- **Agent plugin (0.28.0):** Support `service_tier` on the Responses wire, including
   `-P service_tier=fast` for OpenAI Fast mode, with validation and saved configuration.
 
 - **Core:** Optional `bind_task(envelope)` policy hook called before rollouts with
@@ -24,7 +26,7 @@ All notable changes to this project are documented here. The format is based on
 - **Agent plugin (0.27.0):** Surface environment step budget in system prompt and
   per-observation step count ([#407](https://github.com/robocurve/inspect-robots/issues/407)).
 
-- **Agent plugin (0.27.0):** Configure LLM retry attempts and backoff from the
+- **Agent plugin (0.28.0):** Configure LLM retry attempts and backoff from the
   policy, honor provider `Retry-After` delays on HTTP wires, and record the
   effective settings in evaluation logs ([#441](https://github.com/robocurve/inspect-robots/issues/441)).
 
@@ -1018,7 +1020,6 @@ fix below).
   strict mypy on commit, the 100% coverage gate on push. Install with
   `uv run pre-commit install`. Documented in `CONTRIBUTING.md`.
 
-[Unreleased]: https://github.com/robocurve/inspect-robots/compare/v0.3.0...HEAD
 [0.3.0]: https://github.com/robocurve/inspect-robots/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/robocurve/inspect-robots/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/robocurve/inspect-robots/releases/tag/v0.1.0

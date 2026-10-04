@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import replace
 from pathlib import Path
 from threading import Barrier, Event, Lock
@@ -219,6 +220,40 @@ def test_task_failure_keeps_other_results(tmp_path: Path) -> None:
     assert len(list(tmp_path.glob("*.json"))) == 1
 
 
+def test_parallel_api_preserves_provenance_in_success_and_error_logs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    components: tuple[list[ScriptedPolicy], list[CubePickEmbodiment]],
+) -> None:
+    import inspect_robots.registry as registry
+
+    def fail() -> Task:
+        raise RuntimeError("task construction failed")
+
+    monkeypatch.setitem(registry._FACTORIES["task"], "parallel-b", fail)
+    success, logs = eval_set(
+        ["parallel-a", "parallel-b"],
+        "parallel-policy",
+        "parallel-sim",
+        max_workers=2,
+        log_dir=str(tmp_path),
+        environment_id="parallel-environment",
+        environment_revision="parallel-revision",
+        policy_checkpoint="parallel-checkpoint",
+    )
+    assert not success
+    assert [log.status for log in logs] == ["success", "error"]
+    assert "task construction failed" in str(logs[1].error)
+    saved = [read_eval_log(str(path)) for path in tmp_path.glob("*.json")]
+    assert len(saved) == 1
+    for log in [*logs, *saved]:
+        assert log.eval.environment_id == "parallel-environment"
+        assert log.eval.environment_revision == "parallel-revision"
+        assert log.eval.policy_checkpoint == "parallel-checkpoint"
+    assert all(len(group) == 2 for group in components)
+    assert all(cast(Any, resource).closed == 1 for group in components for resource in group)
+
+
 def test_real_embodiment_never_resets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     import inspect_robots.registry as registry
 
@@ -263,6 +298,136 @@ def test_api_propagates_halts_and_closes_resources(
             "parallel-fail", "parallel-policy", "parallel-sim", max_workers=2, log_dir=str(tmp_path)
         )
     assert all(cast(Any, resource).closed == 1 for group in components for resource in group)
+
+
+@pytest.mark.parametrize("error", [SafetyAbort, EmbodimentFault, KeyboardInterrupt])
+def test_api_cleanup_failures_preserve_halt_and_stop_admission(
+    error: type[BaseException],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from concurrent.futures import ALL_COMPLETED, wait
+    from unittest.mock import patch
+
+    import inspect_robots._parallel as parallel
+    import inspect_robots.registry as registry
+
+    registered("task")
+    halt = error("stop before another task starts")
+    barrier = Barrier(2)
+    started: list[int] = []
+    policies: list[CleanupPolicy] = []
+    embodiments: list[CleanupEmbodiment] = []
+
+    class CleanupPolicy(ScriptedPolicy):
+        closed = 0
+
+        def __init__(self) -> None:
+            super().__init__()
+            policies.append(self)
+
+        def close(self) -> None:
+            self.closed += 1
+            raise RuntimeError("policy cleanup failed")
+
+    class CleanupEmbodiment(CubePickEmbodiment):
+        closed = 0
+
+        def __init__(self) -> None:
+            super().__init__()
+            embodiments.append(self)
+
+        def close(self) -> None:
+            self.closed += 1
+            super().close()
+            raise RuntimeError("embodiment cleanup failed")
+
+    def make_task(index: int) -> Task:
+        started.append(index)
+        if index < 2:
+            barrier.wait(timeout=5)
+        if index == 0:
+            raise halt
+        return _task(f"cleanup-task-{index}")
+
+    names = [f"cleanup-task-{index}" for index in range(4)]
+    for index, name in enumerate(names):
+        monkeypatch.setitem(registry._FACTORIES["task"], name, lambda index=index: make_task(index))
+    monkeypatch.setitem(registry._FACTORIES["policy"], "failing-cleanup-policy", CleanupPolicy)
+    monkeypatch.setitem(registry._FACTORIES["embodiment"], "failing-cleanup-sim", CleanupEmbodiment)
+
+    # Collect the entire first batch together, even if the sibling completes
+    # first, to make the scheduler's admission decision deterministic.
+    with warnings.catch_warnings(record=True) as cleanup_warnings:
+        warnings.simplefilter("always", RuntimeWarning)
+        with (
+            patch.object(
+                parallel, "wait", side_effect=lambda fs, **kw: wait(fs, return_when=ALL_COMPLETED)
+            ),
+            pytest.raises(error) as raised,
+        ):
+            eval_set(
+                names,
+                "failing-cleanup-policy",
+                "failing-cleanup-sim",
+                max_workers=2,
+                log_dir=str(tmp_path),
+            )
+
+    assert raised.value is halt
+    assert sorted(started) == [0, 1]
+    assert len(policies) == len(embodiments) == 2
+    assert all(policy.closed == 1 for policy in policies)
+    assert all(embodiment.closed == 1 for embodiment in embodiments)
+    messages = [str(item.message) for item in cleanup_warnings]
+    assert any("RuntimeError: policy cleanup failed" in message for message in messages)
+    assert any("RuntimeError: embodiment cleanup failed" in message for message in messages)
+
+
+@pytest.mark.parametrize("error", [SafetyAbort, EmbodimentFault, KeyboardInterrupt])
+def test_api_construction_halt_survives_failed_policy_cleanup(
+    error: type[BaseException],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import inspect_robots.registry as registry
+
+    registered("task")
+    halt = error("embodiment construction halted")
+    policies: list[ConstructionPolicy] = []
+
+    class ConstructionPolicy(ScriptedPolicy):
+        closed = 0
+
+        def __init__(self) -> None:
+            super().__init__()
+            policies.append(self)
+
+        def close(self) -> None:
+            self.closed += 1
+            raise RuntimeError("policy construction cleanup failed")
+
+    def fail() -> CubePickEmbodiment:
+        raise halt
+
+    monkeypatch.setitem(
+        registry._FACTORIES["policy"], "construction-cleanup-policy", ConstructionPolicy
+    )
+    monkeypatch.setitem(registry._FACTORIES["embodiment"], "construction-halt-sim", fail)
+    with (
+        pytest.warns(RuntimeWarning, match="RuntimeError: policy construction cleanup failed"),
+        pytest.raises(error) as raised,
+    ):
+        eval_set(
+            "cubepick-reach",
+            "construction-cleanup-policy",
+            "construction-halt-sim",
+            max_workers=2,
+            log_dir=str(tmp_path),
+        )
+    assert raised.value is halt
+    assert len(policies) == 1
+    assert policies[0].closed == 1
 
 
 def test_cli_parallel_preserves_options_and_closes_resources(
@@ -347,6 +512,92 @@ def test_parallel_api_really_overlaps_and_owns_graders(
     assert success
     assert len(graders) == 2 and graders[0] is not graders[1]
     assert all(log.eval.grader == "parallel-grader" for log in logs)
+
+
+@pytest.mark.parametrize("failure_stage", ["factory", "preflight"])
+def test_parallel_grader_rejection_stops_before_constructing_components(
+    failure_stage: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    components: tuple[list[ScriptedPolicy], list[CubePickEmbodiment]],
+) -> None:
+    import inspect_robots.registry as registry
+    from inspect_robots.rollout import TrialRecord
+
+    barrier = Barrier(2)
+    factory_calls: list[bool] = []
+    preflight_calls: list[object] = []
+    task_constructions: list[str] = []
+
+    class RejectingParallelGrader:
+        name = "rejecting-parallel-grader"
+
+        def preflight(self) -> None:
+            preflight_calls.append(self)
+            raise ConfigError("parallel grader preflight rejected")
+
+        def grade(self, record: TrialRecord, scene: Scene) -> None:
+            pytest.fail("a rejecting grader must never grade")
+
+    def make_grader() -> RejectingParallelGrader:
+        factory_calls.append(True)
+        barrier.wait(timeout=5)
+        if failure_stage == "factory":
+            raise ConfigError("parallel grader factory rejected")
+        return RejectingParallelGrader()
+
+    def make_task(name: str) -> Task:
+        task_constructions.append(name)
+        return _task(name)
+
+    for name in ("parallel-a", "parallel-b", "parallel-c"):
+        monkeypatch.setitem(registry._FACTORIES["task"], name, lambda name=name: make_task(name))
+    monkeypatch.setitem(registry._FACTORIES["grader"], "rejecting-parallel-grader", make_grader)
+    with pytest.raises(ConfigError, match=f"parallel grader {failure_stage} rejected"):
+        eval_set(
+            ["parallel-a", "parallel-b", "parallel-c", "parallel-a"],
+            "parallel-policy",
+            "parallel-sim",
+            grader="rejecting-parallel-grader",
+            max_workers=2,
+            log_dir=str(tmp_path),
+        )
+    assert len(factory_calls) == 2
+    assert len(preflight_calls) == (2 if failure_stage == "preflight" else 0)
+    assert components == ([], [])
+    assert task_constructions == []
+    assert not list(tmp_path.glob("*.json"))
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_unknown_grader_propagates_before_constructing_components(
+    workers: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    components: tuple[list[ScriptedPolicy], list[CubePickEmbodiment]],
+) -> None:
+    import inspect_robots.registry as registry
+
+    task_constructions: list[str] = []
+
+    def make_task(name: str) -> Task:
+        task_constructions.append(name)
+        return _task(name)
+
+    for name in ("parallel-a", "parallel-b"):
+        monkeypatch.setitem(registry._FACTORIES["task"], name, lambda name=name: make_task(name))
+    with pytest.raises(KeyError, match="no grader named 'missing-parallel-grader'"):
+        eval_set(
+            ["parallel-a", "parallel-b"],
+            "parallel-policy",
+            "parallel-sim",
+            grader="missing-parallel-grader",
+            max_workers=workers,
+            log_dir=str(tmp_path),
+        )
+    assert components == ([], [])
+    assert task_constructions == []
+    assert not list(tmp_path.glob("*.json"))
 
 
 def test_policy_cleanup_when_embodiment_factory_fails(

@@ -39,7 +39,7 @@ class _LiveScene:
     scene_id: str
     status: str = "success"
     error: str | None = None
-    epochs: list[dict[str, float]] = field(default_factory=list)
+    epochs: list[dict[str, float | None]] = field(default_factory=list)
     operator_judgements: list[str | None] = field(default_factory=list)
     judgement_sources: list[str | None] = field(default_factory=list)
     operator_notes: list[str | None] = field(default_factory=list)
@@ -58,6 +58,10 @@ class LiveLogSink:
     required. A sinks list containing only ``LiveLogSink`` leaves no log after
     a successful run because ``on_eval_end`` removes the live snapshot.
     """
+
+    # on_eval_end deletes the snapshot; the sink fan-out skips it when the
+    # canonical log failed to write, so the run's only record survives.
+    discards_on_eval_end = True
 
     def __init__(
         self,
@@ -242,6 +246,14 @@ class LiveLogSink:
             self._write(self._clock(), force=True)
         except Exception as exc:
             self._disable(exc)
+
+    def retain_snapshot(self) -> None:
+        """Keep the current snapshot: the canonical log failed to write.
+
+        Marks the run finished without deleting the file, so the next
+        ``on_eval_start`` (another ``eval_set`` task) leaves it in place.
+        """
+        self._finished = True
 
     def on_eval_end(self, log: EvalLog) -> None:
         """Remove the transient snapshot after the canonical sink writes the final log."""

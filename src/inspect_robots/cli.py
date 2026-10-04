@@ -268,6 +268,21 @@ def _add_shared_eval_args(parser: argparse.ArgumentParser) -> None:
         help="per-step change limit for the default guardrails, in the action "
         "space's native units (default: derived from the space's bounds)",
     )
+    parser.add_argument(
+        "--environment-id",
+        default=None,
+        help="environment identifier recorded in evaluation metadata",
+    )
+    parser.add_argument(
+        "--environment-revision",
+        default=None,
+        help="environment revision or commit hash recorded in evaluation metadata",
+    )
+    parser.add_argument(
+        "--policy-checkpoint",
+        default=None,
+        help="policy model checkpoint path, hash, or revision recorded in evaluation metadata",
+    )
 
 
 def _port_number(text: str) -> int:
@@ -1018,15 +1033,16 @@ def _select_grader_name(args: argparse.Namespace, defaults: Defaults) -> str | N
     return name
 
 
-def _build_grader(
-    args: argparse.Namespace, defaults: Defaults, session: OperatorSession | None
-) -> Grader | None:
-    """Construct the run's grader, sharing the operator session when one exists.
+def _build_grader(args: argparse.Namespace, defaults: Defaults) -> Grader | None:
+    """Construct the run's grader and run its preflight before anything else.
 
-    Attendedness only picks the *default* name; an explicitly selected grader
-    is built even without a session (its own fallback behavior then applies,
-    e.g. the operator grader constructs a lazy session that degrades on dead
-    stdin).
+    Called before components are resolved, so a grader whose preflight request
+    is rejected stops the run before the robot is connected, the policy loads,
+    or a task is generated (plan 0085). The operator session does not exist
+    yet; ``_connect_grader_session`` attaches it once it does. Attendedness
+    only picks the *default* name; an explicitly selected grader is built even
+    without a session (its own fallback behavior then applies, e.g. the
+    operator grader constructs a lazy session that degrades on dead stdin).
     """
     name = _select_grader_name(args, defaults)
     if name is None:
@@ -1036,10 +1052,21 @@ def _build_grader(
     config_kvs = _config_args("grader", name, defaults.grader_args_owner, defaults.grader_args)
     grader_kvs = {**config_kvs, **_parse_kvs(args.grader_args)}
     grader = cast("Grader", _resolve_or_exit("grader", name, **grader_kvs))
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.eval import _preflight_grader
+
+    try:
+        _preflight_grader(grader)
+    except ConfigError as exc:
+        raise SystemExit(str(exc)) from exc
+    return grader
+
+
+def _connect_grader_session(grader: Grader | None, session: OperatorSession | None) -> None:
+    """Share the run's operator session with a grader that wants one."""
     connect = getattr(grader, "connect_session", None)
     if session is not None and callable(connect):
         connect(session)
-    return grader
 
 
 def _step_limit_count(log: EvalLog) -> int:
@@ -1359,6 +1386,15 @@ def _print_wire_capture(
     _print_wire_call(trials, wire, selected_trial)
 
 
+def _print_survivor_warning(log: EvalLog) -> None:
+    """Flag a successful run whose metrics no clean scene backs (issue #440)."""
+    from inspect_robots.eval import _survivor_warning
+
+    message = _survivor_warning(log)
+    if message is not None:
+        print(_styled(f"warning: {message}", _YELLOW))
+
+
 def _print_run_summary(log: EvalLog, log_path: str, is_adhoc: bool) -> None:
     """Print the compact post-run summary and failure diagnostics."""
     failed = log.status != "success"
@@ -1383,6 +1419,7 @@ def _print_run_summary(log: EvalLog, log_path: str, is_adhoc: bool) -> None:
                 detail = "" if scene.error in (None, log.error) else f": {scene.error}"
                 print(f"  [{_styled(scene.status, _RED)}] {scene.scene_id}{detail}")
     _print_step_limit_notice(log, is_adhoc)
+    _print_survivor_warning(log)
     trials = f"trials: {log.results.total_trials}"
     if errored_count:
         trials += f" ({errored_count} errored)"
@@ -1506,6 +1543,8 @@ def _resolve_components(
     factories = registered("embodiment")
     slots = device_slots(factories[embodiment_name]) if embodiment_name in factories else ()
     claim = claim_devices(slots, embodiment_kvs, os.environ)
+    if resources is not None:
+        resources.callback(claim.release)
     try:
         if args.sim:
             embodiment = _resolve_or_exit(
@@ -1514,7 +1553,8 @@ def _resolve_components(
         else:
             embodiment = _resolve_or_exit("embodiment", embodiment_name, **embodiment_kvs)
     except BaseException:
-        claim.release()
+        if resources is None:
+            claim.release()
         raise
     return _ResolvedComponents(
         policy, policy_name, policy_source, embodiment, embodiment_name, embodiment_source, claim
@@ -1585,9 +1625,11 @@ def _announce_live_view(
     url = ""
     if headless:
         fields = env.get("SSH_CONNECTION", "").split()
-        host = fields[2] if len(fields) == 4 else socket.gethostname()
-        if ":" in host and not (host.startswith("[") and host.endswith("]")):
-            host = f"[{host}]"
+        host = fields[2] if len(fields) == 4 else ""
+        # The suggested `--host 0.0.0.0` server listens on IPv4 only, so an
+        # IPv6 address from SSH_CONNECTION would name a URL nothing serves.
+        if not host or ":" in host:
+            host = socket.gethostname()
         url = f"; open http://{host}:8300/"
     print(
         _styled(
@@ -1672,6 +1714,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
     else:
         task = _resolve_or_exit("task", args.task, **_parse_kvs(args.task_args))
 
+    # Attendedness picks the default grader, never gates grader wiring
+    # (plan 0049). Built and preflighted before any component (plan 0085).
+    grader = _build_grader(args, defaults)
     resolved = _resolve_components(args, defaults)
     embodiment = resolved.embodiment
     voice_input: OperatorInput | None = None
@@ -1740,10 +1785,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         speaker_sink = _build_speaker_sink(args)
         if speaker_sink is not None:
             _start_speaker_sink(speaker_sink)
-        # Attendedness picks the default grader, never gates grader wiring
-        # (plan 0049): an explicit --grader is built session-less and relies
-        # on its own fallback.
-        grader = _build_grader(args, defaults, operator_session)
+        _connect_grader_session(grader, operator_session)
 
         # Construct the sink explicitly so we can tell the user where the log went.
         sink = JsonLogSink(args.log_dir)
@@ -1811,6 +1853,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 ),
                 operator_input=operator_input,
                 grader=grader,
+                environment_id=args.environment_id,
+                environment_revision=args.environment_revision,
+                policy_checkpoint=args.policy_checkpoint,
             )
         except KeyboardInterrupt:
             if sink.path is not None and sink.path.exists():
@@ -1828,7 +1873,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
         try:
             # A failing unlink (read-only remount, full disk) must not skip the
             # close chain below or replace the run's real exception.
-            if live_sink is not None and live_sink.path is not None:
+            # Keep the snapshot only when a canonical write failed (including a
+            # Ctrl-C during that write): then it is the only record of the run.
+            # Otherwise (success, or Ctrl-C before the final write) remove it.
+            # write_failed is sticky across eval_set tasks, so a later task's
+            # half-written snapshot may also be kept; harmless, never lost.
+            if live_sink is not None and live_sink.path is not None and not sink.write_failed:
                 with suppress(OSError):
                     live_sink.path.unlink(missing_ok=True)
         finally:
@@ -1869,6 +1919,10 @@ def _print_eval_set_summary(success: bool, logs: Sequence[EvalLog], log_dir: str
             f"{name}={_format_metric(value)}" for name, value in sorted(log.results.metrics.items())
         )
         detail = metrics or (log.error or "")
+        if metrics and not ok and log.error:
+            # A run can fail yet keep metrics (e.g. ungraded trials abstain);
+            # show why it failed next to them.
+            detail = f"{metrics}  ({log.error})"
         row = f"  [{_styled(_display_status(log.status), _GREEN if ok else _RED)}] {log.eval.task}"
         horizon = _seconds_horizon_text(log)
         if horizon is not None:
@@ -1936,87 +1990,85 @@ def _run_cli_eval_set(
 ) -> tuple[bool, list[EvalLog]]:
     """Own components and sinks for one sequential set, or one parallel task."""
     from inspect_robots import eval_set
+    from inspect_robots._parallel import HaltPreservingExitStack
     from inspect_robots.logging import JsonLogSink, LiveLogSink
 
     tasks = [_resolve_or_exit("task", name) for name in task_names]
     if args.epochs is not None:
         tasks = [_apply_epochs_or_exit(t, args.epochs, attribute_task=True) for t in tasks]
 
-    with ExitStack() as resources:
+    # Attendedness picks the default grader, never gates grader wiring
+    # (plan 0049). Built and preflighted before any component (plan 0085).
+    grader = _build_grader(args, defaults)
+    with HaltPreservingExitStack() as resources:
         resolved = (
             _resolve_components(args, defaults, resources=resources)
             if parallel
             else _resolve_components(args, defaults)
         )
         embodiment = resolved.embodiment
-        voice_input: OperatorInput | None = None
-        live_sink: LiveLogSink | None = None
-        try:
-            if parallel and not embodiment.info.is_simulated:
-                raise SystemExit("--max-workers > 1 requires a simulated embodiment")
-            with _EVAL_SET_OUTPUT_LOCK:
-                _announce_components(resolved)
-                print(f"tasks: {', '.join(task_names)}")
-                approver = _build_and_announce_guardrails(
-                    args, embodiment.info.action_space, resolved.embodiment
-                )
-                _announce_live_view(args, resolved)
-
-            operator_input = None
-            operator_session = None
-            if _attended(args):
-                operator_session, operator_input = _build_operator_session(
-                    resolved.policy, embodiment
-                )
-            voice_input = _build_voice_input(args, operator_input)
-            if voice_input is not None:
-                _start_voice_input(
-                    voice_input,
-                    cast(OperatorSession, operator_input),
-                    resolved.policy,
-                )
-            # Attendedness picks the default grader, never gates grader wiring
-            # (plan 0049): an explicit --grader is built session-less and relies
-            # on its own fallback.
-            grader = _build_grader(args, defaults, operator_session)
-            sink = JsonLogSink(args.log_dir)
-            sinks: list[LogSink] = [sink]
-            if not args.no_live_log:
-                live_sink = LiveLogSink(args.log_dir)
-                sinks.append(live_sink)
-            success, logs = eval_set(
-                tasks,
-                resolved.policy,
-                embodiment,
-                log_dir=args.log_dir,
-                sinks=sinks,
-                seed=args.seed,
-                fail_on_error=args.fail_on_error if args.fail_on_error is not None else False,
-                approver=approver,
-                store_frames=(
-                    args.store_frames if args.store_frames is not None else defaults.store_frames
-                ),
-                retry_attempts=args.retry_attempts,
-                operator_input=operator_input,
-                grader=grader,
+        # The CLI resolved the embodiment itself, so eval_set() does not own
+        # its close. Every callback runs, and cleanup cannot replace a halt.
+        if not parallel:
+            resources.callback(resolved.claim.release)
+        resources.callback(embodiment.close)
+        if parallel and not embodiment.info.is_simulated:
+            raise SystemExit("--max-workers > 1 requires a simulated embodiment")
+        with _EVAL_SET_OUTPUT_LOCK:
+            _announce_components(resolved)
+            print(f"tasks: {', '.join(task_names)}")
+            approver = _build_and_announce_guardrails(
+                args, embodiment.info.action_space, resolved.embodiment
             )
-        finally:
-            # Same "close what we open" contract as _cmd_run: the CLI resolved the
-            # embodiment itself, so it — not eval_set() — is responsible for
-            # releasing it, exactly once, after every task has run.
-            try:
-                # A failing unlink must not skip the close chain (see _cmd_run).
-                if live_sink is not None and live_sink.path is not None:
+            _announce_live_view(args, resolved)
+
+        operator_input = None
+        operator_session = None
+        if _attended(args):
+            operator_session, operator_input = _build_operator_session(resolved.policy, embodiment)
+        voice_input = _build_voice_input(args, operator_input)
+        resources.callback(_close_voice_input, voice_input)
+        if voice_input is not None:
+            _start_voice_input(
+                voice_input,
+                cast(OperatorSession, operator_input),
+                resolved.policy,
+            )
+        _connect_grader_session(grader, operator_session)
+        sink = JsonLogSink(args.log_dir)
+        sinks: list[LogSink] = [sink]
+        if not args.no_live_log:
+            live_sink = LiveLogSink(args.log_dir)
+            sinks.append(live_sink)
+
+            def remove_live_snapshot() -> None:
+                # A canonical-write failure makes the live snapshot the only
+                # record of this run. Otherwise unlink it, including on halts.
+                # An unlink failure must still allow the remaining closes.
+                if live_sink.path is not None and not sink.write_failed:
                     with suppress(OSError):
                         live_sink.path.unlink(missing_ok=True)
-            finally:
-                try:
-                    _close_voice_input(voice_input)
-                finally:
-                    try:
-                        embodiment.close()
-                    finally:
-                        resolved.claim.release()
+
+            resources.callback(remove_live_snapshot)
+        success, logs = eval_set(
+            tasks,
+            resolved.policy,
+            embodiment,
+            log_dir=args.log_dir,
+            sinks=sinks,
+            seed=args.seed,
+            fail_on_error=args.fail_on_error if args.fail_on_error is not None else False,
+            approver=approver,
+            store_frames=(
+                args.store_frames if args.store_frames is not None else defaults.store_frames
+            ),
+            retry_attempts=args.retry_attempts,
+            operator_input=operator_input,
+            grader=grader,
+            environment_id=args.environment_id,
+            environment_revision=args.environment_revision,
+            policy_checkpoint=args.policy_checkpoint,
+        )
         return success, logs
 
 
@@ -2059,6 +2111,7 @@ def _cmd_inspect(
     if log.results.errored_trials:
         trials += f" ({log.results.errored_trials} errored)"
     print(f"scenes:      {log.results.total_scenes}   {trials}")
+    _print_survivor_warning(log)
     if log.stats.frames_dir is not None:
         from inspect_robots._video import count_frames, resolve_frames_dir
 
@@ -2075,7 +2128,9 @@ def _cmd_inspect(
                 print(_styled(f"hint: render videos with: inspect-robots video {path}", _DIM))
     print("metrics:")
     for name, value in sorted(log.results.metrics.items()):
-        print(f"  {name}: {_format_metric(value)}")
+        abstained = log.results.abstentions.get(name, 0)
+        suffix = f" ({abstained} abstained)" if abstained else ""
+        print(f"  {name}: {_format_metric(value)}{suffix}")
     print("scenes:")
     for scene in log.samples:
         reduced = "  ".join(f"{k}={_format_metric(v)}" for k, v in sorted(scene.reduced.items()))
@@ -2765,7 +2820,11 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     Purely declarative — the embodiment is constructed (adapters keep
     constructors hardware-free by convention) but never reset or stepped.
     """
-    from inspect_robots.conformance import check_embodiment, missing_runtime_requirements
+    from inspect_robots.conformance import (
+        check_device_slots,
+        check_embodiment,
+        missing_runtime_requirements,
+    )
     from inspect_robots.registry import registered
 
     defaults = load_defaults(os.environ)
@@ -2777,9 +2836,14 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     )
     kvs = {**config_kvs, **_parse_kvs(args.embodiment_args)}
     print(f"embodiment: {name} ({source})")
-    missing = missing_runtime_requirements(registered("embodiment").get(name))
+    factory = registered("embodiment").get(name)
+    missing = missing_runtime_requirements(factory)
     for module, remedy in missing.items():
         print(f"  [error] runtime-requirement: {module} missing → {remedy}")
+    # Check before construction so constructor failures do not hide device findings.
+    device_issues = check_device_slots(factory, kvs)
+    for issue in device_issues:
+        print(f"  [{issue.severity}] {issue.code}: {issue.message}")
     embodiment = _resolve_or_exit("embodiment", name, **kvs)
     try:
         report = check_embodiment(embodiment.info)
@@ -2788,7 +2852,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     print(report.summary())
     if not report.ok:
         print("see the adapter authoring guide: docs/guide/adapters.md")
-    return 1 if not report.ok or missing else 0
+    return 1 if not report.ok or missing or device_issues else 0
 
 
 def _cmd_setup() -> int:

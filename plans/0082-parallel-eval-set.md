@@ -29,6 +29,10 @@ Caller-owned objects and mutable hooks are rejected in the parallel Python API.
 The CLI requires `--no-prompt` and rejects voice input. Policies with an optional
 `close()` hook are released, including when embodiment construction fails.
 Embodiments and CLI claims are released through their existing ownership paths.
+Every owned cleanup callback runs even if another close fails. Cleanup failures
+during an escaping safety halt or interrupt are reported as warnings and never
+replace the original halt. Grader construction and preflight happen before each
+task opens its components; grading configuration errors stop task admission.
 Existing run directories, log schema and seed derivation are retained.
 
 ## Verification

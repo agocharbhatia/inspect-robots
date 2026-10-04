@@ -15,8 +15,10 @@ from inspect_robots.scorer import (
     min_distance_to_goal,
     operator_scorer,
     reached_goal_state,
+    reduce_mean,
     reduce_scores,
     success_at_end,
+    value_to_float,
 )
 from inspect_robots.types import Action, Observation, StepResult
 
@@ -117,6 +119,31 @@ def test_mean_over_nonnumeric_string_raises() -> None:
         reduce_scores("mean", scores)
 
 
+def test_abstention_stays_none_instead_of_counting_as_zero() -> None:
+    assert value_to_float(None) is None
+    assert value_to_float(False) == 0.0
+
+
+def test_reducers_skip_abstained_epochs() -> None:
+    scores = [Score(value=True), Score(value=None), Score(value=False)]
+    assert reduce_scores("mean", scores).value == 0.5
+    assert reduce_scores("min", scores).value == 0.0
+    categorical = [Score(value=None), Score(value=None), Score(value="a")]
+    assert reduce_scores("mode", categorical).value == "a"
+    assert reduce_scores("pass_at_2", scores).value == pytest.approx(1.0)
+
+
+def test_all_abstained_epochs_reduce_to_an_abstention() -> None:
+    assert reduce_scores("mean", [Score(value=None), Score(value=None)]).value is None
+    with pytest.raises(ValueError, match="unknown epoch reducer"):
+        reduce_scores("nope", [Score(value=None)])
+
+
+def test_numeric_reducer_called_directly_on_an_abstention_raises() -> None:
+    with pytest.raises(TypeError, match="abstained"):
+        reduce_mean([Score(value=None)])
+
+
 def test_pass_at_k() -> None:
     # 4 epochs, 1 success: pass@1 = 1/4, pass@4 = 1.0
     scores = [Score(value=True), Score(value=False), Score(value=False), Score(value=False)]
@@ -132,3 +159,11 @@ def test_unknown_reducer_raises() -> None:
 def test_vlm_scorer_stub_points_at_the_vlm_grader() -> None:
     with pytest.raises(NotImplementedError, match=r"'vlm' grader \(--grader vlm\)"):
         VLMScorer()(_record([], success=False), None)
+
+
+def test_builtin_scorers_custom_name() -> None:
+    assert success_at_end(name="custom_success").name == "custom_success"
+    assert episode_length(name="custom_len").name == "custom_len"
+    assert min_distance_to_goal(name="custom_dist").name == "custom_dist"
+    assert reached_goal_state(0.05, name="custom_reached").name == "custom_reached"
+    assert operator_scorer(name="custom_op").name == "custom_op"

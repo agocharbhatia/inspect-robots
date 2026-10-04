@@ -179,8 +179,10 @@ tool result does not report seconds.
 
 When the embodiment publishes operating notes via `EmbodimentInfo.docs`
 (joint layout, sign conventions, gripper polarity), the policy appends them
-to the system prompt as an `Embodiment notes:` section. When run under `eval()`,
-the policy receives the trial horizon via `bind_task()` and appends an
+to the system prompt as an `Embodiment notes:` section. The system prompt
+also includes an `Embodiment bounds:` section with per-dimension limits and
+labels any pinned dimensions (`Pinned dimensions: ... (fixed; do not attempt to move them)`).
+When run under `eval()`, the policy receives the trial horizon via `bind_task()` and appends an
 `Environment step budget:` section to the system prompt, as well as tracking
 remaining environment steps in each observation. The per-step
 observation also labels the proprioceptive state vector with the action
@@ -302,7 +304,7 @@ The effective retry settings are recorded in `EvalSpec.policy_config` so a
 run can be reproduced from its log.
 
 `service_tier` applies to `-P wire=responses` only. Accepted values are
-`auto`, `default`, `flex`, `priority`, and `fast`. Leave it unset (or pass
+`auto`, `default`, `flex`, `priority`, `fast`, and `ultrafast`. Leave it unset (or pass
 `-P service_tier=none`) to omit the request field and retain the project's
 default. `default` explicitly requests standard processing. For OpenAI Fast
 mode, add these options to the existing task/embodiment command:
@@ -315,6 +317,20 @@ OpenAI also accepts `priority` for Fast mode. This setting is independent of
 reasoning effort and robot speed. Model and project eligibility still apply,
 and Fast mode has a per-token premium; see the
 [OpenAI Fast mode guide](https://developers.openai.com/api/docs/guides/fast-mode).
+
+For GPT-6 Astra Ultrafast, set `OPENAI_API_KEY` and use
+`-P service_tier=ultrafast`. To test with the mock embodiment and no hardware:
+
+```bash
+inspect-robots "pick up the cube" --policy agent --embodiment cubepick \
+    -P model=openai/gpt-6-astra -P wire=responses -P effort=low \
+    -P service_tier=ultrafast
+```
+
+Ultrafast uses your API project's access and billing. See the
+[OpenAI Ultrafast mode guide](https://developers.openai.com/api/docs/guides/ultrafast-mode)
+for current availability, regional restrictions, and pricing.
+
 The requested tier is saved in `policy_config.service_tier`. Wire capture
 preserves the request and provider response, including the actual returned
 `service_tier`, which can differ from the requested tier.

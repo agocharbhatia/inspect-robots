@@ -17,7 +17,6 @@ import time
 import uuid
 import warnings
 from collections.abc import Callable, Sequence
-from contextlib import ExitStack
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -51,7 +50,13 @@ from inspect_robots.log import (
 from inspect_robots.policy import Policy
 from inspect_robots.rollout import TrialRecord, derive_seed, rollout
 from inspect_robots.scene import Scene
-from inspect_robots.scorer import Score, get_reducer, reduce_scores, value_to_float
+from inspect_robots.scorer import (
+    Score,
+    get_reducer,
+    reduce_scores,
+    reducer_min_epochs,
+    value_to_float,
+)
 from inspect_robots.task import Task
 from inspect_robots.transcript import judgement_source
 
@@ -91,6 +96,19 @@ def _grading_hook(
             f"grade(record, scene) method); got {type(grader).__name__}"
         )
     return grader.grade, grader
+
+
+def _preflight_grader(grader: Grader | None) -> None:
+    """Run the grader's optional ``preflight()`` hook before any rollout.
+
+    Duck-typed like ``config()`` so graders without it still satisfy the
+    protocol. The hook raises ``ConfigError`` when every trial would be
+    rejected; it is idempotent, so the CLI, ``eval_set`` and ``eval`` may all
+    call it.
+    """
+    hook = getattr(grader, "preflight", None)
+    if callable(hook):
+        hook()
 
 
 def _grader_identity(grader: Grader | None) -> tuple[str | None, dict[str, Any]]:
@@ -201,23 +219,116 @@ def _git_commit() -> str | None:
     return commit
 
 
+class _CriticalSinkError(Exception):
+    """Carry a critical sink's failure past the remaining sinks' fan-out."""
+
+    def __init__(self, original: Exception) -> None:
+        super().__init__(str(original))
+        self.original = original
+
+
 class _Broadcast:
     """Fan a sink lifecycle out to several sinks, preserving hook order."""
 
     def __init__(self, sinks: list[LogSink]):
         self._sinks = sinks
+        # Critical sinks (the canonical log) are served first, so a failed
+        # final write is known before any sink discards its own record.
+        self._ordered = sorted(sinks, key=lambda s: not getattr(s, "critical", False))
         policy_message_hooks: list[Callable[[int, Sequence[Any]], None]] = []
         for sink in sinks:
             hook = getattr(sink, "log_policy_messages", None)
             if callable(hook):
                 policy_message_hooks.append(hook)
         self._policy_message_hooks = policy_message_hooks
+        # Transcript hooks that raised this trial: skipped until the next
+        # on_trial_start, preserving plan 0020's per-trial failure latch.
+        self._failed_message_hooks: set[int] = set()
         if policy_message_hooks:
             self.log_policy_messages = self._fan_policy_messages
 
+    @staticmethod
+    def _safe_call(
+        sink: Any,
+        method_name: str,
+        fn: Callable[..., Any],
+        *args: Any,
+        may_be_critical: bool = True,
+    ) -> bool:
+        """Call one sink hook, isolating its failure; return whether it succeeded.
+
+        A failing sink warns instead of aborting the eval or starving the other
+        sinks (#511), unless it declares ``critical = True`` (the canonical
+        ``JsonLogSink``): then the error is re-raised once every sink has been
+        offered the hook, so a lost eval log is never reported as success.
+        """
+        try:
+            fn(*args)
+        except (SafetyAbort, EmbodimentFault):
+            raise
+        except Exception as exc:
+            if may_be_critical and getattr(sink, "critical", False):
+                raise _CriticalSinkError(exc) from exc
+            sink_name = type(sink).__name__ if sink is not None else "LogSink"
+            warnings.warn(
+                f"LogSink {sink_name}.{method_name}() failed with {type(exc).__name__}: {exc}",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            return False
+        return True
+
+    def _fan_out(self, method_name: str, *args: Any, optional: bool = False) -> None:
+        """Offer one hook to every sink, then surface a critical sink's failure.
+
+        ``optional`` hooks are duck-typed: sinks without a callable attribute
+        of that name are skipped. Critical sinks run first; if one fails,
+        sinks marked ``discards_on_eval_end`` (the live snapshot, which deletes
+        itself) are skipped so the only surviving record of the run is kept.
+        """
+        failure: Exception | None = None
+        for s in self._ordered:
+            hook: Any = getattr(s, method_name, None)
+            if optional and not callable(hook):
+                continue
+            if (
+                failure is not None
+                and method_name == "on_eval_end"
+                and getattr(s, "discards_on_eval_end", False)
+            ):
+                # Keep the record; tell the sink so a later run does not
+                # delete it either (eval_set reuses sinks across tasks).
+                retain = getattr(s, "retain_snapshot", None)
+                if callable(retain):
+                    retain()
+                continue
+            try:
+                self._safe_call(s, method_name, hook, *args)
+            except _CriticalSinkError as exc:
+                if failure is None:
+                    failure = exc.original
+                else:
+                    warnings.warn(
+                        f"LogSink {type(s).__name__}.{method_name}() also failed with "
+                        f"{type(exc.original).__name__}: {exc.original}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+        if failure is not None:
+            raise failure
+
     def _fan_policy_messages(self, t: int, messages: Sequence[Any]) -> None:
-        for hook in self._policy_message_hooks:
-            hook(t, messages)
+        for index, hook in enumerate(self._policy_message_hooks):
+            if index in self._failed_message_hooks:
+                continue
+            sink = getattr(hook, "__self__", None)
+            # Never critical: rollout downgrades transcript errors to "streaming
+            # off" anyway, so a failing hook just warns and latches for the trial.
+            ok = self._safe_call(
+                sink, "log_policy_messages", hook, t, messages, may_be_critical=False
+            )
+            if not ok:
+                self._failed_message_hooks.add(index)
 
     def bind_spaces(self, action_space: Box, observation_space: ObservationSpace) -> None:
         """Offer the resolved spaces to sinks that declare a bind_spaces hook.
@@ -225,46 +336,52 @@ class _Broadcast:
         Duck-typed like ``log_policy_messages``: sinks without the attribute
         are unaffected, so the sink Protocol is unchanged.
         """
-        for sink in self._sinks:
-            hook = getattr(sink, "bind_spaces", None)
-            if callable(hook):
-                hook(action_space, observation_space)
+        self._fan_out("bind_spaces", action_space, observation_space, optional=True)
 
     def bind_frames_dir(self, frames_dir: str | None) -> None:
         """Offer the run's frame directory to sinks that declare the optional hook."""
-        for sink in self._sinks:
-            hook = getattr(sink, "bind_frames_dir", None)
-            if callable(hook):
-                hook(frames_dir)
+        self._fan_out("bind_frames_dir", frames_dir, optional=True)
 
     def bind_scenes(self, scenes: Sequence[Scene]) -> None:
         """Offer the run's scenes to sinks that declare the optional hook."""
-        for sink in self._sinks:
-            hook = getattr(sink, "bind_scenes", None)
-            if callable(hook):
-                hook(scenes)
+        self._fan_out("bind_scenes", scenes, optional=True)
 
     def on_eval_start(self, spec: EvalSpec) -> None:
-        for s in self._sinks:
-            s.on_eval_start(spec)
+        self._fan_out("on_eval_start", spec)
 
     def on_trial_start(self, scene_id: str, epoch: int) -> None:
-        for s in self._sinks:
-            s.on_trial_start(scene_id, epoch)
+        self._failed_message_hooks.clear()
+        self._fan_out("on_trial_start", scene_id, epoch)
 
     def log_step(
         self, t: int, observation: Observation, action: Action, result: StepResult
     ) -> None:
-        for s in self._sinks:
-            s.log_step(t, observation, action, result)
+        self._fan_out("log_step", t, observation, action, result)
 
     def on_trial_end(self, record: TrialRecord) -> None:
-        for s in self._sinks:
-            s.on_trial_end(record)
+        self._fan_out("on_trial_end", record)
 
     def on_eval_end(self, log: EvalLog) -> None:
-        for s in self._sinks:
-            s.on_eval_end(log)
+        self._fan_out("on_eval_end", log)
+
+
+def _survivor_warning(log: EvalLog) -> str | None:
+    """Describe a "success" whose metrics no clean scene backs, else ``None``.
+
+    ``fail_on_error`` decides whether errored trials fail the run. When it
+    tolerates them yet every scene errored, the metrics rest on whichever
+    trials survived and can look entirely ordinary (issue #440), so callers
+    and readers are warned instead of the status being overridden.
+    """
+    if log.status != "success" or not log.samples:
+        return None
+    if any(scene.status != "error" for scene in log.samples):
+        return None
+    errored, total = log.results.errored_trials, log.results.total_trials
+    return (
+        f"no scene completed cleanly ({errored} of {total} trial(s) errored); "
+        "metrics may rest on a surviving minority of trials"
+    )
 
 
 def eval(
@@ -310,7 +427,10 @@ def eval(
     empty entry in ``SceneResult.epochs``.
 
     A run in which **every** trial errored (nothing was scored) always ends
-    with ``status == "error"``, regardless of ``fail_on_error``.
+    with ``status == "error"``, regardless of ``fail_on_error``. A run in which
+    no scene completed cleanly keeps the status ``fail_on_error`` gives it, but
+    emits a ``UserWarning`` (issue #440): its metrics may rest on a surviving
+    minority of trials.
 
     Ctrl-C during a rollout records the partial trial and writes a log with
     ``status == "cancelled"``, then re-raises the interrupt (as a
@@ -355,7 +475,13 @@ def eval(
 
     Raises [`CompatibilityError`][inspect_robots.errors.CompatibilityError] (fail fast, before any
     rollout) if the policy and embodiment are incompatible, and
-    [`ConfigError`][inspect_robots.errors.ConfigError] for an invalid epoch reducer.
+    [`ConfigError`][inspect_robots.errors.ConfigError] for an invalid epoch reducer
+    (including ``pass_at_<k>`` with fewer than ``k`` planned epochs) or a
+    grader whose ``preflight()`` request is rejected (checked before any
+    string component is resolved). A trial the grader tried and failed to
+    grade is scored as an abstention by the ``operator`` scorer, and the run
+    then ends with ``status == "error"`` and an "N of M trial(s) ungraded"
+    message.
     """
     if not isinstance(fail_on_error, bool) and not (
         isinstance(fail_on_error, (int, float))
@@ -369,6 +495,9 @@ def eval(
     from inspect_robots.registry import resolve
 
     before_scoring, resolved_grader = _grading_hook(grader, before_scoring)
+    # Before resolving string components: a grader that would reject every
+    # trial must fail before any robot connection is opened (plan 0085).
+    _preflight_grader(resolved_grader)
     owns_embodiment = isinstance(embodiment, str)
     task = cast(Task, resolve("task", task)) if isinstance(task, str) else task
     policy = cast(Policy, resolve("policy", policy)) if isinstance(policy, str) else policy
@@ -465,6 +594,14 @@ def _run_eval(
         get_reducer(epoch_spec.reducer)
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
+    # A reducer that needs more epochs than planned can never succeed; say so
+    # before spending robot time. Abstentions are still checked at scoring.
+    min_epochs = reducer_min_epochs(epoch_spec.reducer)
+    if epoch_spec.count < min_epochs:
+        raise ConfigError(
+            f"epoch reducer {epoch_spec.reducer!r} needs at least {min_epochs} epochs, "
+            f"but the task plans {epoch_spec.count}; raise Epochs.count or lower k"
+        )
 
     if seed is None:
         # Draw and record a real seed so the run stays reproducible after the
@@ -525,6 +662,10 @@ def _run_eval(
     error: str | None = None
     error_count = 0
     errored_trials = 0
+    graded_attempts = 0
+    ungraded_trials = 0
+    first_grading_error: str | None = None
+    abstentions: dict[str, int] = {}
 
     halted = False
     stopped = False
@@ -535,7 +676,7 @@ def _run_eval(
     planned_trials = len(task.scenes) * epoch_spec.count
     for scene in task.scenes:
         per_scorer_scores: dict[str, list[Score]] = {s.name: [] for s in scorers}
-        epoch_dicts: list[dict[str, float]] = []
+        epoch_dicts: list[dict[str, float | None]] = []
         judgements: list[str | None] = []
         judgement_sources: list[str | None] = []
         notes: list[str | None] = []
@@ -660,7 +801,13 @@ def _run_eval(
                                             stacklevel=2,
                                         )
                         before_scoring(record, scene)
-                    epoch_values: dict[str, float] = {}
+                        graded_attempts += 1
+                        grading_error = record.metadata.get("grading_error")
+                        if grading_error and record.operator_judgement is None:
+                            ungraded_trials += 1
+                            if first_grading_error is None:
+                                first_grading_error = str(grading_error)
+                    epoch_values: dict[str, float | None] = {}
                     for scorer in scorers:
                         try:
                             score = scorer(record, scene.target)
@@ -684,6 +831,8 @@ def _run_eval(
                             continue
                         per_scorer_scores[scorer.name].append(score)
                         epoch_values[scorer.name] = value
+                        if value is None:
+                            abstentions[scorer.name] = abstentions.get(scorer.name, 0) + 1
                     epoch_dicts.append(epoch_values)
                     # Captured at the same instant as the judgement, on purpose:
                     # these fields are documented as strictly parallel, so a later
@@ -749,7 +898,7 @@ def _run_eval(
                 stopped = True
                 break
 
-        reduced: dict[str, float] = {}
+        reduced: dict[str, float | None] = {}
         for name, scene_scores in per_scorer_scores.items():
             if not scene_scores:
                 continue
@@ -796,11 +945,26 @@ def _run_eval(
         status = "error"
         error = f"all {total_trials} trial(s) errored; nothing was scored"
 
-    metrics: dict[str, float] = {}
+    if ungraded_trials:
+        # The grader tried and failed on these trials (plan 0085). They abstain
+        # rather than score as failures, but a run with ungraded trials must
+        # never read as a clean success. A more specific error keeps its
+        # message and gains the count.
+        count = f"{ungraded_trials} of {graded_attempts} trial(s) ungraded"
+        if status == "success":
+            status = "error"
+            error = f"{count}: grader failed ({first_grading_error})"
+        else:
+            error = "; ".join(part for part in (error, count) if part)
+
+    metrics: dict[str, float | None] = {}
     for scorer in scorers:
         vals = [sr.reduced[scorer.name] for sr in scene_results if scorer.name in sr.reduced]
         if vals:
-            metrics[scorer.name] = mean(vals)
+            # Abstentions carry no verdict, so they are left out of the mean;
+            # a scorer that abstained on every scene reports None, not 0.0.
+            voted = [v for v in vals if v is not None]
+            metrics[scorer.name] = mean(voted) if voted else None
 
     stats = EvalStats(
         started_at=started_iso,
@@ -819,12 +983,23 @@ def _run_eval(
             total_trials=total_trials,
             metrics=metrics,
             errored_trials=errored_trials,
+            abstentions=abstentions,
         ),
         stats=stats,
         samples=tuple(scene_results),
         error=error,
     )
-    bus.on_eval_end(log)
+    try:
+        bus.on_eval_end(log)
+    except Exception as exc:
+        # A failed final write must not swallow the user's Ctrl-C: eval_set
+        # would otherwise treat the OSError as a task error and continue.
+        if cancelled_exc is not None:
+            raise cancelled_exc from exc
+        raise
+    survivor_warning = _survivor_warning(log)
+    if survivor_warning is not None:
+        warnings.warn(survivor_warning, UserWarning, stacklevel=3)
     if cancelled_exc is not None:
         raise cancelled_exc
     return [log]
@@ -853,6 +1028,15 @@ def _component_name(component: Policy | Embodiment) -> str:
         return type(component).__name__
 
 
+def _safe_info_attr(component: object, attr: str) -> str | None:
+    try:
+        info = getattr(component, "info", None)
+        value = getattr(info, attr, None)
+        return str(value) if value is not None else None
+    except Exception:
+        return None
+
+
 def _error_log_for(
     task: Task | str,
     policy: Policy | str,
@@ -860,6 +1044,9 @@ def _error_log_for(
     *,
     seed: int | None,
     exc: Exception,
+    environment_id: str | None = None,
+    environment_revision: str | None = None,
+    policy_checkpoint: str | None = None,
 ) -> EvalLog:
     """Describe a task failure that occurred before or outside log production."""
     now = _now_iso()
@@ -876,6 +1063,20 @@ def _error_log_for(
             seed=seed,
             max_steps=None if isinstance(task, str) else task.max_steps,
             max_seconds=None if isinstance(task, str) else task.max_seconds,
+            environment_id=environment_id
+            or (
+                _safe_info_attr(embodiment, "environment_id")
+                if not isinstance(embodiment, str)
+                else None
+            ),
+            environment_revision=environment_revision
+            or (
+                _safe_info_attr(embodiment, "environment_revision")
+                if not isinstance(embodiment, str)
+                else None
+            ),
+            policy_checkpoint=policy_checkpoint
+            or (_safe_info_attr(policy, "checkpoint") if not isinstance(policy, str) else None),
         ),
         results=EvalResults(total_scenes=0, total_trials=0),
         stats=EvalStats(
@@ -908,6 +1109,9 @@ def eval_set(
     grader: Grader | str | None = None,
     retry_attempts: int = 0,
     max_workers: int = 1,
+    environment_id: str | None = None,
+    environment_revision: str | None = None,
+    policy_checkpoint: str | None = None,
 ) -> tuple[bool, list[EvalLog]]:
     """Run a set of tasks and return ``(success, logs)`` (mirrors Inspect AI).
 
@@ -931,7 +1135,10 @@ def eval_set(
 
     ``grader``/``before_scoring`` follow ``eval()``'s contract (one pre-scoring
     hook, not both). Sequential runs resolve the grader once and share it;
-    parallel runs construct a grader per task.
+    its optional ``preflight()`` runs before the first task and a rejection
+    propagates instead of becoming a per-task error log. Parallel runs
+    construct and preflight a grader per task before opening its components;
+    grading configuration errors also propagate and stop task admission.
 
     Caller-supplied ``sinks`` are reused across the set's sequential runs. Each
     sink must reset its per-run state in ``on_eval_start`` and tolerate one
@@ -949,7 +1156,11 @@ def eval_set(
     a stable run id) is reserved for a follow-up: ``retry_attempts`` is accepted
     now so callers don't get retrofitted, but is not yet honored.
     """
-    from inspect_robots._parallel import run_parallel, validate_max_workers
+    from inspect_robots._parallel import (
+        HaltPreservingExitStack,
+        run_parallel,
+        validate_max_workers,
+    )
 
     validate_max_workers(max_workers)
     task_list = [tasks] if isinstance(tasks, Task | str) else list(tasks)
@@ -977,8 +1188,12 @@ def eval_set(
         registered("task")  # Finish plugin discovery before workers access the registry.
 
         def run_task(task: Task | str) -> list[EvalLog]:
+            # Configuration rejection must escape the per-task error handler
+            # and occur before opening components, as in sequential eval_set.
+            _, task_grader = _grading_hook(grader, None)
+            _preflight_grader(task_grader)
             try:
-                with ExitStack() as resources:
+                with HaltPreservingExitStack() as resources:
                     task_policy = cast(Policy, resolve("policy", policy))
                     close_policy = getattr(task_policy, "close", None)
                     if callable(close_policy):
@@ -997,12 +1212,26 @@ def eval_set(
                         remap=remap,
                         store_frames=store_frames,
                         store_actions=store_actions,
-                        grader=grader,
+                        grader=task_grader,
+                        environment_id=environment_id,
+                        environment_revision=environment_revision,
+                        policy_checkpoint=policy_checkpoint,
                     )
             except (SafetyAbort, EmbodimentFault):
                 raise
             except Exception as exc:
-                return [_error_log_for(task, policy, embodiment, seed=seed, exc=exc)]
+                return [
+                    _error_log_for(
+                        task,
+                        policy,
+                        embodiment,
+                        seed=seed,
+                        exc=exc,
+                        environment_id=environment_id,
+                        environment_revision=environment_revision,
+                        policy_checkpoint=policy_checkpoint,
+                    )
+                ]
 
         if not task_list:
             raise ConfigError("eval_set() requires at least one task; got an empty sequence")
@@ -1014,6 +1243,9 @@ def eval_set(
     before_scoring, resolved_grader = _grading_hook(grader, before_scoring)
     if not task_list:
         raise ConfigError("eval_set() requires at least one task; got an empty sequence")
+    # Outside the per-task try below: a rejected preflight must stop the whole
+    # set, not become the first task's error log while later tasks run.
+    _preflight_grader(resolved_grader)
     logs: list[EvalLog] = []
     for task in task_list:
         try:
@@ -1037,6 +1269,9 @@ def eval_set(
                     # would leave every eval_set log with no grader recorded.
                     grader=resolved_grader,
                     before_scoring=None if resolved_grader is not None else before_scoring,
+                    environment_id=environment_id,
+                    environment_revision=environment_revision,
+                    policy_checkpoint=policy_checkpoint,
                 )
             )
         except (SafetyAbort, EmbodimentFault):
@@ -1049,6 +1284,9 @@ def eval_set(
                     embodiment,
                     seed=seed,
                     exc=exc,
+                    environment_id=environment_id,
+                    environment_revision=environment_revision,
+                    policy_checkpoint=policy_checkpoint,
                 )
             )
     success = all(log.status == "success" for log in logs)

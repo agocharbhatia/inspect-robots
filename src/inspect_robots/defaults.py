@@ -32,6 +32,7 @@ catch.
 from __future__ import annotations
 
 import configparser
+import math
 import os
 import sys
 from collections.abc import Mapping
@@ -58,8 +59,10 @@ def _parse_value(text: str) -> Any:
 
     A value wrapped in matching single or double quotes is returned as the
     literal inner string with no coercion — the escape hatch for strings the
-    heuristics would otherwise claim (``-P effort="'none'"`` sends the wire
-    string ``none`` instead of omitting the parameter).
+    heuristics would otherwise claim (``-P effort="'none'"`` returns the string
+    ``none`` untouched, while bare ``effort=none`` parses to Python ``None``;
+    effort-taking components interpret both as the explicit ``none`` effort
+    level, not as an omitted setting or a fallback to another level).
     """
     if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
         return text[1:-1]
@@ -70,7 +73,10 @@ def _parse_value(text: str) -> Any:
         return None
     for caster in (int, float):
         try:
-            return caster(text)
+            val = caster(text)
+            if caster is float and not math.isfinite(val):
+                continue
+            return val
         except ValueError:
             continue
     return text
@@ -118,8 +124,10 @@ class Defaults:
 def config_path(env: Mapping[str, str]) -> Path | None:
     """Return the user config file path derived from ``env``.
 
-    ``INSPECT_ROBOTS_CONFIG`` names the config file itself and takes precedence
-    over ``XDG_CONFIG_HOME`` and ``HOME``. Otherwise, the result is
+    ``INSPECT_ROBOTS_CONFIG`` names the config file itself and takes precedence.
+    Otherwise the config home is the first set of ``XDG_CONFIG_HOME``,
+    ``HOME/.config``, then, for native Windows shells that set neither,
+    ``APPDATA`` and ``USERPROFILE/.config``. The result is
     ``<config-home>/inspect-robots/config.ini``, whether or not the file exists.
     Return ``None`` when none of those variables is set; a variable set to the
     empty string counts as unset.
@@ -130,6 +138,10 @@ def config_path(env: Mapping[str, str]) -> Path | None:
         home = Path(xdg)
     elif user_home := env.get("HOME"):
         home = Path(user_home) / ".config"
+    elif app_data := env.get("APPDATA"):
+        home = Path(app_data)
+    elif profile := env.get("USERPROFILE"):
+        home = Path(profile) / ".config"
     else:
         return None
     return home / "inspect-robots" / "config.ini"
@@ -277,7 +289,9 @@ def _set_default(env: Mapping[str, str], key: str, value: str) -> Path:
 
     path = config_path(env)
     if path is None:
-        raise SystemExit("cannot locate a config home: set $XDG_CONFIG_HOME or $HOME")
+        raise SystemExit(
+            "cannot locate a config home: set $XDG_CONFIG_HOME, $HOME or (on Windows) %APPDATA%"
+        )
     parser = configparser.ConfigParser(inline_comment_prefixes=(";", "#"), interpolation=None)
     if path.is_file():
         try:

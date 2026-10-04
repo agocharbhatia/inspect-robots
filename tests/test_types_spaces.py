@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import Any
 
 import numpy as np
 import pytest
@@ -78,6 +79,69 @@ def test_box_dim_and_bounds_validation() -> None:
 def test_box_rejects_inverted_bounds() -> None:
     with pytest.raises(ValueError, match="low must be elementwise"):
         Box(shape=(2,), low=np.array([0.0, 1.0]), high=np.array([1.0, 0.5]))
+
+
+@pytest.mark.parametrize(
+    "invalid_shape", [(0,), (-1,), (2, 0), (2, -3), (True,), (2.5,), [3], "invalid"]
+)
+def test_box_rejects_invalid_shapes(invalid_shape: object) -> None:
+    with pytest.raises(ValueError, match="Box shape"):
+        Box(shape=invalid_shape)  # type: ignore[arg-type]
+
+
+def test_box_scalar_shape() -> None:
+    box = Box(shape=(), low=np.array(0.0), high=np.array(1.0))
+    assert box.shape == ()
+    assert box.dim == 1
+
+
+@pytest.mark.parametrize(
+    ("name", "height", "width", "channels"),
+    [
+        ("", 100, 100, 3),
+        ("   ", 100, 100, 3),
+        (123, 100, 100, 3),
+        ("wrist", 0, 100, 3),
+        ("wrist", -10, 100, 3),
+        ("wrist", 100, 0, 3),
+        ("wrist", 100, -5, 3),
+        ("wrist", 100, 100, 0),
+        ("wrist", 100, 100, -1),
+        ("wrist", 100, 100, True),
+        ("wrist", 100, 100, 3.5),
+    ],
+)
+def test_camera_spec_rejects_invalid_attributes(
+    name: Any, height: Any, width: Any, channels: Any
+) -> None:
+    with pytest.raises(ValueError, match="CameraSpec"):
+        CameraSpec(name=name, height=height, width=width, channels=channels)
+
+
+@pytest.mark.parametrize(
+    ("key", "shape"),
+    [
+        ("", (6,)),
+        ("   ", (6,)),
+        (123, (6,)),
+        ("joint_pos", (0,)),
+        ("joint_pos", (-1,)),
+        ("joint_pos", (2, 0)),
+        ("joint_pos", (True,)),
+        ("joint_pos", (3.5,)),
+        ("joint_pos", [6]),
+        ("joint_pos", "bad"),
+    ],
+)
+def test_state_field_rejects_invalid_attributes(key: Any, shape: Any) -> None:
+    with pytest.raises(ValueError, match="StateField"):
+        StateField(key=key, shape=shape)
+
+
+def test_state_field_scalar_shape() -> None:
+    sf = StateField(key="gripper", shape=())
+    assert sf.shape == ()
+    assert sf.key == "gripper"
 
 
 def test_action_semantics_defaults() -> None:
@@ -195,6 +259,26 @@ def test_observation_space_rejects_inconsistent_state_keys() -> None:
         ObservationSpace(state_keys=frozenset({"eef_pos"}), state=spec)
 
 
+def test_state_spec_rejects_duplicate_field_keys() -> None:
+    with pytest.raises(ValueError, match="duplicate field key 'joint_pos'"):
+        StateSpec(
+            fields=(
+                StateField(key="joint_pos", shape=(6,)),
+                StateField(key="joint_pos", shape=(7,)),
+            )
+        )
+
+
+def test_observation_space_rejects_duplicate_camera_names() -> None:
+    with pytest.raises(ValueError, match="duplicate camera name 'wrist'"):
+        ObservationSpace(
+            cameras=(
+                CameraSpec(name="wrist", height=100, width=100),
+                CameraSpec(name="wrist", height=200, width=200),
+            )
+        )
+
+
 def test_task_envelope_is_a_frozen_view_of_the_horizon() -> None:
     from inspect_robots.errors import ConfigError
     from inspect_robots.scene import Scene
@@ -213,8 +297,8 @@ def test_task_envelope_is_a_frozen_view_of_the_horizon() -> None:
         _ = seconds_task.envelope
 
 
-@pytest.mark.parametrize("max_steps", [True, 0, -1])
-def test_task_rejects_invalid_steps_horizon(max_steps: int) -> None:
+@pytest.mark.parametrize("max_steps", [True, False, 0, -1, 10.5, float("nan"), float("inf"), "80"])
+def test_task_rejects_invalid_steps_horizon(max_steps: Any) -> None:
     from inspect_robots.errors import ConfigError
     from inspect_robots.scene import Scene
     from inspect_robots.task import Task
@@ -226,6 +310,15 @@ def test_task_rejects_invalid_steps_horizon(max_steps: int) -> None:
             scorer="success_at_end",
             max_steps=max_steps,
         )
+
+
+@pytest.mark.parametrize("max_steps", [True, False, 0, -1, 10.5, float("nan"), float("inf"), "80"])
+def test_task_envelope_rejects_invalid_max_steps(max_steps: Any) -> None:
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.task import TaskEnvelope
+
+    with pytest.raises(ConfigError, match="TaskEnvelope max_steps must be an integer >= 1"):
+        TaskEnvelope(name="t", max_steps=max_steps)
 
 
 def test_task_rejects_duplicate_scene_ids() -> None:
@@ -347,6 +440,43 @@ def test_task_validation_and_scorer_names() -> None:
 
     mixed = Task(name="t", scenes=[scene], scorer=[episode_length(), "success_at_end"], max_steps=5)
     assert [s.name for s in mixed.scorers] == ["episode_length", "success_at_end"]
+
+
+def test_task_rejects_duplicate_scorer_names() -> None:
+    from inspect_robots.errors import ConfigError
+    from inspect_robots.scene import Scene
+    from inspect_robots.scorer import reached_goal_state
+    from inspect_robots.task import Task
+
+    scene = Scene(id="s", instruction="reach")
+
+    with pytest.raises(ConfigError, match=r"Task 't': duplicate scorer name 'reached_goal_state'"):
+        Task(
+            name="t",
+            scenes=[scene],
+            scorer=[reached_goal_state(0.0), reached_goal_state(100.0)],
+            max_steps=5,
+        )
+
+    with pytest.raises(ConfigError, match=r"Task 't': duplicate scorer name 'success_at_end'"):
+        Task(
+            name="t",
+            scenes=[scene],
+            scorer=["success_at_end", "success_at_end"],
+            max_steps=5,
+        )
+
+    # Distinct names for the same scorer type are accepted
+    task = Task(
+        name="t",
+        scenes=[scene],
+        scorer=[
+            reached_goal_state(0.0, name="reached_strict"),
+            reached_goal_state(100.0, name="reached_loose"),
+        ],
+        max_steps=5,
+    )
+    assert [s.name for s in task.scorers] == ["reached_strict", "reached_loose"]
 
 
 def test_operator_end_constant_is_public_vocabulary() -> None:
